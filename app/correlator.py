@@ -32,9 +32,14 @@
 可能是绝对值极大的负数（如 -1e20）。不可达哨兵必须严格小于任何可达
 分值，故使用真正的负无穷（不可达状态参与 max/加减时自然被淘汰，且不会
 被四舍五入进导出 JSON）；最优性比较使用尺度感知的 ULP 容差（同一分值
-经正/反表独立递推只相差数个浮点 ULP，给固定 ULP 余量），而不是按分值
-成比例放大的相对容差——相对容差在 2e20 量级会放大到 2e11，足以把
-相差 1e10（匹配中层需多开一次间隙）的次优归属误判为并列。
+经正/反表独立递推只相差数个浮点 ULP），而不是按分值成比例放大的相对
+容差——相对容差在 2e20 量级会放大到 2e11，足以把相差 1e10（匹配中层
+需多开一次间隙）的次优归属误判为并列。ULP 余量也不能取与递推深度无关
+的固定大值：固定 4096 ULP 在 2e20 量级窗口约 1.3e8，仍会把相差 1e8
+（约 3052 ULP，如 open=1e20、extend=9.99999999999e19 时端层与中层的
+真实分差）的次优归属误判为并列。舍入噪声随递推步数线性累积（每步至多
+约 1 ULP），故余量按段内步数线性缩放（基准 64 + 每步 16），段内计分、
+正反向歧义、归属计数、主解回溯与枚举共用同一预算，口径一致。
 """
 import math
 
@@ -46,16 +51,25 @@ NEG = float("-inf")
 # 并列判定容差：
 # * 绝对容差 1e-7 兜底 0 附近（open/extend=0 时整段分值恒为 0）的舍入；
 # * 大尺度改用 ULP（2^52 精度下 1e20 量级一个 ULP 约 1.6e4）：同一数值经
-#   正表、反表、间隙区小表独立递推，舍入差只有数个 ULP，给 4096 ULP 余量
-#   已远宽于实际舍入，又远小于“多开一次间隙”造成的 1e10 级真实分差，
-#   不会把 -1.9999999999e20（端层最优）与 -2e20（中层次优）判为并列。
+#   正表、反表、间隙区小表独立递推，每个递推步至多累积约 1 个 ULP 的舍入
+#   差，故余量按段内步数线性缩放（基准 64 + 每步 16，约为噪声上限的 10
+#   倍），既吸收正/反表独立递推的舍入噪声，又远小于“多开一次间隙”造成的
+#   真实分差（open=1e20、extend=9.99999999999e19 时端层与中层相差 1e8，
+#   约 3052 ULP；3x1 段预算仅 128 ULP ≈ 4.2e6）。旧固定 4096 ULP 窗口在
+#   该量级放大到 1.3e8，会把这种次优归属误判为并列。
 TOL_ABS = 1e-7
-TOL_ULP = 4096
+TOL_ULP_BASE = 64        # 独立比较（无段上下文）的默认 ULP 余量
+TOL_ULP_PER_STEP = 16    # 段内每个递推步追加的 ULP 余量
 MAX_SOLUTIONS = 100
 COUNT_CAP = 9999          # 并列解计数封顶，避免大整数
 
 
-def close(a, b, atol=TOL_ABS, ulps=TOL_ULP):
+def _seg_ulps(n, m):
+    """段内最优性比较的 ULP 余量：随递推步数（噪声累积上限）线性缩放。"""
+    return TOL_ULP_BASE + TOL_ULP_PER_STEP * (n + m)
+
+
+def close(a, b, atol=TOL_ABS, ulps=TOL_ULP_BASE):
     """尺度感知的近似相等：绝对容差兜底小分值，大分值按浮点 ULP 计。
 
     不可达（-inf）只与 -inf 相等。ULP 容差随“较大绝对值”一侧的浮点
@@ -146,14 +160,15 @@ def _gap_cost_table(gap_open, gap_extend, n, m):
     return cost, GH, GV
 
 
-def _canonical_region(a, b, p, q, gap_open, gap_extend):
+def _canonical_region(a, b, p, q, gap_open, gap_extend, ulps=TOL_ULP_BASE):
     """间隙区（从匹配节点 (p,q) 起跳 a 个 A、b 个 B）的规范步骤（局部 1 基）。
 
     在区域局部两态小 DP（尺寸 (a,b)，自匹配态 (0,0) 出发）上自 (a,b) 向
     (0,0) 回溯，给出达到最优代价的一条确定排列：并列时优先延续同侧
     （游程数最少、最易读），同侧不可行再切换另一侧，首个游程从匹配态
-    直接开出；最终反转。仅用于主解与方案枚举的展示，不参与计分。步骤
+    直接开出；仅用于主解与方案枚举的展示，不参与计分。步骤
     编号换算为段内绝对坐标（GA: p+1..p+a、GB: q+1..q+b）。
+    ulps 为调用方所属段的并列判定 ULP 余量，保证与计分口径一致。
     """
     if a == 0 and b == 0:
         return []
@@ -164,7 +179,8 @@ def _canonical_region(a, b, p, q, gap_open, gap_extend):
     # 游程数最少）；不可达为 -inf，不可选到 x=0 的 H 或 y=0 的 V。
     h_ok, v_ok = math.isfinite(lH[x][y]), math.isfinite(lV[x][y])
     assert h_ok or v_ok, "间隙区终点不可达（不应出现：调用方只回溯最优区）"
-    state = "H" if h_ok and (not v_ok or close(lH[x][y], lV[x][y])) else "V"
+    state = "H" if h_ok and (
+        not v_ok or close(lH[x][y], lV[x][y], ulps=ulps)) else "V"
     while x > 0 or y > 0:
         if state == "H":
             cont = lH[x-1][y] - gap_extend
@@ -172,9 +188,9 @@ def _canonical_region(a, b, p, q, gap_open, gap_extend):
             start = -gap_open if (x == 1 and y == 0) else NEG
             best = max(cont, switch, start)
             steps.append(("GA", p + x, 0))
-            if math.isfinite(cont) and close(cont, best):
+            if math.isfinite(cont) and close(cont, best, ulps=ulps):
                 state = "H"
-            elif math.isfinite(switch) and close(switch, best):
+            elif math.isfinite(switch) and close(switch, best, ulps=ulps):
                 state = "V"
             else:
                 state = "D"
@@ -185,9 +201,9 @@ def _canonical_region(a, b, p, q, gap_open, gap_extend):
             start = -gap_open if (x == 0 and y == 1) else NEG
             best = max(cont, switch, start)
             steps.append(("GB", 0, q + y))
-            if math.isfinite(cont) and close(cont, best):
+            if math.isfinite(cont) and close(cont, best, ulps=ulps):
                 state = "V"
-            elif math.isfinite(switch) and close(switch, best):
+            elif math.isfinite(switch) and close(switch, best, ulps=ulps):
                 state = "H"
             else:
                 state = "D"
@@ -214,8 +230,12 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
 
     状态 D：上一步为匹配；H：上一步为 A 出列（B 方向间隙，参考层未匹配）；
     V：上一步为 B 出列（A 方向间隙，待校核层未匹配）。
+
+    段内全部最优性比较共用同一 ULP 余量 ulps（随段内递推步数线性缩放），
+    保证计分、歧义判定、归属计数与主解回溯口径一致。
     """
     n, m = len(A), len(B)
+    ulps = _seg_ulps(n, m)
     D = [[NEG] * (m + 1) for _ in range(n + 1)]
     H = [[NEG] * (m + 1) for _ in range(n + 1)]
     V = [[NEG] * (m + 1) for _ in range(n + 1)]
@@ -295,9 +315,9 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
                     # best 初值 -inf：有限 val 恒严格优于 -inf
                     if not math.isfinite(best):
                         best, cnt = val, CD[p][q]
-                    elif val > best and not close(val, best):
+                    elif val > best and not close(val, best, ulps=ulps):
                         best, cnt = val, CD[p][q]       # 严格更大：替换
-                    elif close(val, best):
+                    elif close(val, best, ulps=ulps):
                         cnt = min(COUNT_CAP, cnt + CD[p][q])  # 容差内：并列
             FD[i][j], CD[i][j] = best, cnt
 
@@ -308,7 +328,7 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
             if not math.isfinite(FD[p][q]):
                 continue
             val = FD[p][q] + gcost[(n - p, m - q)]
-            if close(val, total):
+            if close(val, total, ulps=ulps):
                 total_count = min(COUNT_CAP, total_count + CD[p][q])
 
     # ---- 判定每条匹配边 (i,j) 是否在某条最优路径上 ----
@@ -317,7 +337,7 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
     for i in range(1, n + 1):
         for j in range(1, m + 1):
             pre = max(D[i-1][j-1], H[i-1][j-1], V[i-1][j-1])
-            on_path = close(pre + sim[(i, j)] + RD[i][j], total)
+            on_path = close(pre + sim[(i, j)] + RD[i][j], total, ulps=ulps)
             if on_path:
                 match_edges[(i, j)] = True
                 match_partners[i].add(j)
@@ -335,12 +355,12 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
             )
             if not math.isfinite(best):
                 continue
-            if close(best + RH[i][j], total):
+            if close(best + RH[i][j], total, ulps=ulps):
                 gap_positions[i].add(0)
 
     # ---- 主解回溯（偏好：间隙区尽量小 = 尽量多匹配）----
     primary = _build_primary_steps(
-        n, m, sim, FD, gcost, total, gap_open, gap_extend)
+        n, m, sim, FD, gcost, total, gap_open, gap_extend, ulps)
 
     return {
         "total": total,
@@ -352,11 +372,12 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
         "D": D, "H": H, "V": V,
         "RD": RD, "RH": RH, "RV": RV,
         "FD": FD, "CD": CD, "gcost": gcost, "GH": GH, "GV": GV,
+        "ulps": ulps,
     }
 
 
 def _best_region_predecessor(i, j, FD, gcost, target, real_match,
-                             sim_score=0.0):
+                             sim_score=0.0, ulps=TOL_ULP_BASE):
     """节点 (i,j) 经最优间隙区后的最佳前驱匹配节点 (p,q)。
 
     target 为该节点要求达到的分值。real_match=True 表示 (i,j) 是真实
@@ -376,14 +397,14 @@ def _best_region_predecessor(i, j, FD, gcost, target, real_match,
             a = i - p - 1 if real_match else i - p
             b = j - q - 1 if real_match else j - q
             val = FD[p][q] + gcost[(a, b)] + (sim_score if real_match else 0.0)
-            if close(val, target):
+            if close(val, target, ulps=ulps):
                 cands.append((p, q, a + b))
     cands.sort(key=lambda t: (t[2], -t[0], -t[1]))
     return cands[0][0], cands[0][1]
 
 
 def _build_primary_steps(n, m, sim, FD, gcost, total,
-                         gap_open, gap_extend):
+                         gap_open, gap_extend, ulps=TOL_ULP_BASE):
     """从段尾反向贪心选出主解，再展开为正向规范步骤。
 
     每个 block 记 (前驱(p,q), 当前(ci,cj), 当前是否真实匹配节点)。
@@ -397,19 +418,19 @@ def _build_primary_steps(n, m, sim, FD, gcost, total,
         return []
     # 段尾：优先“匹配到 (n,m)”收尾（真实匹配节点，real_match=True），
     # 否则以纯间隙收尾（虚节点，real_match=False）
-    match_end = math.isfinite(FD[i][j]) and close(FD[i][j], total)
+    match_end = math.isfinite(FD[i][j]) and close(FD[i][j], total, ulps=ulps)
     if match_end:
         p, q = _best_region_predecessor(
-            i, j, FD, gcost, FD[i][j], True, sim[(i, j)])
+            i, j, FD, gcost, FD[i][j], True, sim[(i, j)], ulps)
     else:
         p, q = _best_region_predecessor(
-            i, j, FD, gcost, total, False)
+            i, j, FD, gcost, total, False, 0.0, ulps)
     blocks.append((p, q, i, j, match_end))
     i, j = p, q
     # 其余节点必为真实匹配节点
     while i > 0 or j > 0:
         p, q = _best_region_predecessor(
-            i, j, FD, gcost, FD[i][j], True, sim[(i, j)])
+            i, j, FD, gcost, FD[i][j], True, sim[(i, j)], ulps)
         blocks.append((p, q, i, j, True))
         i, j = p, q
     steps = []
@@ -417,12 +438,12 @@ def _build_primary_steps(n, m, sim, FD, gcost, total,
         if is_match:
             # 匹配节点 (ci,cj) 与前驱 (p,q) 之间跳过 ci-p-1 / cj-q-1 层
             steps.extend(_canonical_region(
-                ci - p - 1, cj - q - 1, p, q, gap_open, gap_extend))
+                ci - p - 1, cj - q - 1, p, q, gap_open, gap_extend, ulps))
             steps.append(("M", ci, cj))
         else:
             # 纯间隙收尾：跳过 ci-p / cj-q 层
             steps.extend(_canonical_region(
-                ci - p, cj - q, p, q, gap_open, gap_extend))
+                ci - p, cj - q, p, q, gap_open, gap_extend, ulps))
     return steps
 
 
@@ -441,6 +462,7 @@ def _enum_segment_paths(seg, limit=MAX_SOLUTIONS):
     FD = seg["FD"]
     gcost = seg["gcost"]
     go, ge = seg["gap_open"], seg["gap_extend"]
+    ulps = seg["ulps"]
     results = []
 
     def successors(i, j):
@@ -459,15 +481,15 @@ def _enum_segment_paths(seg, limit=MAX_SOLUTIONS):
             for nj in range(j + 1, m + 1):
                 a, b = ni - i - 1, nj - j - 1
                 base = prefix + gcost[(a, b)] + sim[(ni, nj)]
-                if close(base, FD[ni][nj]) and \
-                        close(FD[ni][nj] + seg["RD"][ni][nj], total):
-                    region = _canonical_region(a, b, i, j, go, ge)
+                if close(base, FD[ni][nj], ulps=ulps) and \
+                        close(FD[ni][nj] + seg["RD"][ni][nj], total, ulps=ulps):
+                    region = _canonical_region(a, b, i, j, go, ge, ulps)
                     out.append((ni, nj, region + [("M", ni, nj)], True))
         # 段尾 (n,m) 纯间隙收尾：跳过 n-i / m-j 层，不产生匹配
         a, b = n - i, m - j
         if a > 0 or b > 0:
-            if close(prefix + gcost[(a, b)], total):
-                region = _canonical_region(a, b, i, j, go, ge)
+            if close(prefix + gcost[(a, b)], total, ulps=ulps):
+                region = _canonical_region(a, b, i, j, go, ge, ulps)
                 out.append((n, m, region, False))
         # 主解优先：匹配收尾在前；间隙区小（匹配多）在前；顺序确定
         out.sort(key=lambda t: (not t[3], len(t[2]), -(t[0] + t[1]), -t[0]))
