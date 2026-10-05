@@ -27,10 +27,13 @@ python wsgi.py          # http://localhost:8000
 核心算法（`app/correlator.py`）不依赖 Flask，可直接运行回归测试
 （含“全零参数下单层对单层只计 2 个并列解”、“低开间隙惩罚 `gap_open=0`、
 `gap_extend=1` 下 2×2 应得 6 个归属、不漏全部未匹配”、“极大开间隙惩罚
-`gap_open=1e20` 下合法负分 `-1e20` 不被当作不可达、2×1 应得 2 个归属”与
+`gap_open=1e20` 下合法负分 `-1e20` 不被当作不可达、2×1 应得 2 个归属”、
 “大数值 `gap_open=1e20`、`gap_extend=9.999999999e19` 下 3×1 只算首/末层
-两个归属、中层不伪并列”四类反例，以及大数值真并列保留、容差边界和多
-标志层分段锚点组合用例；另含两个端到端 HTTP 用例，无 Flask 时自动跳过）：
+两个归属、中层不伪并列”与“更逼近的大数值
+`gap_open=1e20`、`gap_extend=9.99999999999e19`（真实分差仅 3052 个浮点
+ULP）下 3×1 仍只算首/末层两个归属”两类伪并列反例，以及大数值真并列
+（含锁定标志层、多段组合）保留、容差边界和多标志层分段锚点组合用例；
+另含三个端到端 HTTP 用例，无 Flask 时自动跳过）：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -44,7 +47,8 @@ python3 -m unittest discover -s tests -v
 参考层未匹配（开一个间隙游程），最优分值是合法的负数 `-1e20`。旧实现以
 `-1e18` 作“不可达”哨兵，`-1e20` 比哨兵更负，可达状态被当成不可达、DP 表
 被幻影值污染，`POST /api/correlate` 在规范回溯时直接报 500。修复后哨兵
-为真正的负无穷、最优性比较按分值尺度缩放，下面的独立数据调用应得到
+为真正的负无穷、最优性比较用固定 256 ULP 窗口（不随分值放大），下面的
+独立数据调用应得到
 **`dp_score=-1e20`、两个并列归属（各留一个未匹配参考层）**，
 `solution_count` 与 `solutions_listed` 均为 2，不再返回 500：
 
@@ -82,17 +86,30 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
 
 `PUT /api/settings` 允许任意**非负** `gap_open` / `gap_extend`，取值可以
 任意大。当五项相似度权重全为 0、参考孔**三层**、待校核孔**一层**、不锁
-标志层，并设 `gap_open=1e20`、`gap_extend=9.999999999e19` 时：待校核层
-匹配参考孔**首层或末层**都只开一个间隙游程（代价
-`-(open+extend)=-1.9999999999e20`），是真正的并列最优；而匹配**中层**要在
-匹配前后各开一次间隙（两个游程，代价 `-2e20`），真实分差 `1e10`（该量级
-约 30 万个浮点 ULP），严格次优。旧实现在最优性比较中使用与分值成比例的
-相对容差 `1e-9`，其窗口在 2e20 量级被放大到 `2e11`，反而把中层的低分归属
-算进并列，`solution_count` / `solutions_listed` 都错误地变成 3，中层还混入
-主解与歧义区间。修复后容差改为 ULP 口径（`1e20` 量级一个 ULP 约 1.6e4，
-余量 4096 ULP ≈ 1.3e8，远小于 1e10 的真实分差），独立数据调用应得到
-**`dp_score=-1.9999999999e20`、恰好两个并列归属（首层 / 末层）**，中层只出
-现在未匹配侧，歧义区间只覆盖首、末两层：
+标志层时：待校核层匹配参考孔**首层或末层**都只开一个间隙游程（代价
+`-(open+extend)`），是真正的并列最优；而匹配**中层**要在匹配前后各开
+一次间隙（两个游程，代价 `-2*open`），严格次优。问题在于随着
+`gap_extend` 逼近 `gap_open`，这两个分值的**真实分差会越来越小**：
+
+| `gap_extend` | 端层最优 | 中层次优 | 真实分差 | 2e20 量级折算 |
+|---|---|---|---|---|
+| `9.999999999e19` | `-1.9999999999e20` | `-2e20` | `1e10` | ≈ 30 万个 ULP |
+| `9.99999999999e19` | `-1.999999999999e20` | `-2e20` | `≈1.0001e8` | **恰好 3052 个 ULP** |
+
+（2e20 量级一个浮点 ULP = 32768。）旧实现在最优性比较中使用与分值成比例
+的相对容差 `1e-9`，其窗口在 2e20 量级被放大到 `2e11`，第一行就把中层的
+低分归属算进并列；改成固定 4096 ULP（窗口 `≈1.34e8`）后第一行通过，但
+第二行真实分差只剩 3052 ULP，**仍被 4096 ULP 窗口吞掉**，
+`solution_count` / `solutions_listed` 又错误地变成 3，中层还混入主解与
+歧义区间。
+
+修复后窗口固定为 **256 个浮点 ULP**。依据：一条 DP 路径只有 n+m 次加减
+法，同一分值经正表、反表、间隙区小表独立递推的舍入差，在 Fraction 地面
+真值、3 万余条真最优边（网格到 12×12、0 到 1e20 全尺度）上实测**不超过
+8 ULP**——256 ULP 对舍入噪声留数十倍余量（`≈8.4e6`），又远小于第二行
+3052 ULP（`≈1e8`）的真实分差。独立数据调用应得到
+**`dp_score=-1.999999999999e20`、恰好两个并列归属（首层 / 末层）**，中层
+只出现在未匹配侧，歧义区间只覆盖首、末两层：
 
 ```bash
 docker compose up -d --build
@@ -108,10 +125,10 @@ curl -s -XPOST $BASE/api/boreholes -H 'Content-Type: application/json' -d '{
   "name":"H","collar_elev":100,"x":10,"layers":[
     {"top":0,"bottom":2,"lithology":"砂岩","grain":"中粒","water":"稍湿","confidence":0.9}]}' >/dev/null
 
-# 五项权重全 0；open 与 extend 都取 1e20 量级但相差 1
+# 五项权重全 0；extend 逼近 open，使真实分差只剩 3052 个浮点 ULP
 curl -s -XPUT $BASE/api/settings -H 'Content-Type: application/json' -d '{
   "weights":{"lithology":0,"grain":0,"water":0,"elev":0,"confidence":0},
-  "gap_open":1e20,"gap_extend":9.999999999e19}' >/dev/null
+  "gap_open":1e20,"gap_extend":9.99999999999e19}' >/dev/null
 
 RID=$(curl -s $BASE/api/state | python3 -c 'import sys,json;print(next(b["id"] for b in json.load(sys.stdin)["boreholes"] if b["name"]=="R"))')
 # 不锁标志层：marker_ids 留空
@@ -119,18 +136,25 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
   -d "{\"reference_id\":$RID,\"marker_ids\":[]}" \
 | python3 -c 'import sys,json;h=json.load(sys.stdin)["holes"][0];print("dp_score =",h["dp_score"],"| solution_count =",h["solution_count"],"| solutions_listed =",h["solutions_listed"]);[print(s["pairs"],"unref",s["unmatched_ref"],"unhole",s["unmatched_hole"]) for s in h["tie_solutions"]];print("歧义参考层序号 =",[a["ref_seq"] for a in h["ambiguities"]])'
 # 期望：
-#   dp_score = -1.9999999999e+20 | solution_count = 2 | solutions_listed = 2
-#   [(<R1>, <H1>)] unref [<R2>, <R3>] unhole []
-#   [(<R3>, <H1>)] unref [<R1>, <R2>] unhole []
+#   dp_score = -1.999999999999e+20 | solution_count = 2 | solutions_listed = 2
+#   [[<R1 的 id>, <H1 的 id>]] unref [<R2 的 id>, <R3 的 id>] unhole []
+#   [[<R3 的 id>, <H1 的 id>]] unref [<R1 的 id>, <R2 的 id>] unhole []
 #   歧义参考层序号 = [1, 3]      # 中层 R2 在任何最优路径上都只能未匹配
 # 「导出 JSON」(GET /api/export) 的 last_result 与上述口径一致。
 ```
 
+把 `gap_extend` 换成稍远的 `9.999999999e19`（真实分差 1e10、约 30 万
+ULP）是同一反例更宽松的一档，结论相同（对应单元测试
+`HugeGapPenaltyTest.test_3x1_near_equal_huge_penalties_middle_not_pseudo_tie`）。
+
 同量级下**逐位相等的真正并列不受影响**：把上例改成参考孔两层、待校核孔
 一层并设 `gap_open=gap_extend=1e20`，匹配首层与匹配末层的代价同为
-`-1e20`，仍返回两个并列归属（见测试 `HugeGapPenaltyTest` 中的
+`-1e20`（差 0 ULP），仍返回两个并列归属；锁定标志层下、多段组合的真并列
+也都保留（见测试 `HugeGapPenaltyTest` 中的
 `test_genuine_tie_preserved_at_huge_scale` /
-`test_genuine_tie_preserved_huge_open_small_extend`）。
+`test_genuine_tie_preserved_huge_open_small_extend` /
+`test_genuine_tie_with_locked_marker_huge_scale` /
+`test_genuine_tie_multi_segment_combination_huge_scale`）。
 
 ### 复现“低开间隙惩罚漏解”反例
 
@@ -179,9 +203,10 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
   - 三态 DP（匹配态、参考孔间隙态、待校核孔间隙态）实现**仿射间隙代价**（开间隙 `gap_open`、续间隙 `gap_extend`），
     保持层序单调、允许尖灭/缺失/新增层；不可达哨兵为真正的负无穷，合法的负最优分
     （如 `gap_open=1e20` 下的 `-1e20`）不会被误判为不可达；最优性比较采用
-    ULP 尺度容差（小分值绝对容差 `1e-7` 兜底、大分值 4096 个浮点 ULP），
-    只吸收正/反表独立递推的舍入噪声，不会把“多开一次间隙”造成的 `1e10`
-    级真实分差误判为并列；
+    **固定 256 个浮点 ULP 的窗口**（小分值另以绝对容差 `1e-7` 兜底），只吸收
+    正/反表与间隙区小表独立递推的舍入噪声（实测 ≤8 ULP），不随分值绝对值放大，
+    因而即使真实分差被极大费用压缩到约 3000 ULP（多开一次间隙），也不会被误判
+    为并列；费用在浮点下逐位相等（0 ULP）的真正并列照常保留；
   - 总分按 `匹配相似度之和 / max(两孔层数) × 100` 归一化（`dp_score` 为未归一化的 DP 原始分）。
 - **输出**：相关层带（匹配对及五项相似度明细）、未匹配层（参考孔侧/待校核孔侧分列）、
   锚点对、总分与多孔平均分。
